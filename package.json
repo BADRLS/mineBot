@@ -1,0 +1,26 @@
+{
+  "name": "intelligent-minecraft-agent",
+  "version": "1.0.0",
+  "description": "An AI-controlled Minecraft bot using Mineflayer",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "minecraft",
+    "bot",
+    "mineflayer",
+    "pathfinder"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.105.0",
+    "dotenv": "^16.4.5",
+    "mineflayer": "^4.20.0",
+    "mineflayer-armor-manager": "^2.0.1",
+    "mineflayer-auto-eat": "^5.0.3",
+    "mineflayer-pathfinder": "^2.4.4",
+    "mineflayer-pvp": "^1.3.2"
+  }
+}
