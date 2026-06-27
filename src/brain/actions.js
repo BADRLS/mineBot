@@ -10,6 +10,8 @@
 
 const { Movements, goals } = require('mineflayer-pathfinder');
 const { Vec3 } = require('vec3');
+const { equipBestWeapon } = require('./utils');
+const { HOSTILE_MOB_NAMES } = require('./constants');
 
 function log(message, type = 'ACTION') {
   const timestamp = new Date().toISOString();
@@ -25,6 +27,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         message: {
           type: 'string',
           description: 'The chat message to send. Keep it short and natural — 1-2 sentences max.',
@@ -39,6 +42,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         player_name: {
           type: 'string',
           description: 'Name of a player to walk towards. Used when you want to approach a specific player.',
@@ -55,6 +59,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         block_type: {
           type: 'string',
           description: 'The Minecraft block type to mine, e.g. "oak_log", "stone", "coal_ore", "iron_ore".',
@@ -69,6 +74,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         player_name: {
           type: 'string',
           description: 'The name of the player to follow.',
@@ -83,10 +89,21 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         max_distance: {
           type: 'number',
           description: 'Maximum search radius in blocks. Defaults to 16 if not provided.',
         },
+      },
+    },
+  },
+  {
+    name: 'flee',
+    description: 'Run away from the nearest hostile mob by pathfinding to a safe distance.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
       },
     },
   },
@@ -96,6 +113,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         item_name: { type: 'string', description: 'The item to equip (e.g. "iron_sword").' },
         destination: { type: 'string', description: 'Where to equip. MUST be one of: "hand", "head", "torso", "legs", "feet". Use "head", "torso", "legs", "feet" for armor pieces specifically. Default is "hand".' },
       },
@@ -108,6 +126,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         item_name: { type: 'string', description: 'The item to toss.' },
         count: { type: 'number', description: 'How many to toss. Default is all of them.' },
       },
@@ -120,6 +139,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         item_name: { type: 'string', description: 'The item to craft (e.g. "oak_planks", "crafting_table", "wooden_pickaxe").' },
         count: { type: 'number', description: 'How many times to execute the recipe. Default is 1.' },
       },
@@ -132,6 +152,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         item_name: { type: 'string', description: 'The item you want to produce (e.g. "iron_ingot", "stone"). MUST match target_item.' },
         input_name: { type: 'string', description: 'The raw item to smelt (e.g. "raw_iron", "cobblestone").' },
         fuel_name: { type: 'string', description: 'The fuel to use (e.g. "coal", "oak_planks", "charcoal").' },
@@ -146,6 +167,7 @@ const TOOL_SCHEMAS = [
     input_schema: {
       type: 'object',
       properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         block_type: { type: 'string', description: 'The block type to place (e.g. "dirt").' },
         x: { type: 'number', description: 'Target X coordinate.' },
         y: { type: 'number', description: 'Target Y coordinate.' },
@@ -159,7 +181,36 @@ const TOOL_SCHEMAS = [
     description: 'Do nothing this tick. Use when the situation is calm and no action is needed, or when waiting for something.',
     input_schema: {
       type: 'object',
-      properties: {},
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+      },
+    },
+  },
+  {
+    name: 'store_in_container',
+    description: 'Pathfind to the nearest chest and deposit an item. If item_name is "overflow", the bot will automatically deposit bulk/low-value materials (stone, dirt, sand, etc.).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+        item_name: { type: 'string', description: 'The item to deposit, or "overflow" to deposit bulk trash.' },
+        count: { type: 'number', description: 'How many to deposit. Default is all of them.' },
+      },
+      required: ['item_name'],
+    },
+  },
+  {
+    name: 'give_item_to_player',
+    description: 'Pathfind to a player and drop an item at their feet.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+        player_name: { type: 'string', description: 'Name of the player to give the item to.' },
+        item_name: { type: 'string', description: 'The item to give.' },
+        count: { type: 'number', description: 'How many to give. Default is all of them.' },
+      },
+      required: ['player_name', 'item_name'],
     },
   },
 ];
@@ -178,6 +229,17 @@ async function autoCraft(bot, itemId, count = 1, seen = new Set()) {
   seen.add(itemId);
 
   const needed = count - currentCount;
+  
+  if (bot.inventory.emptySlotCount() === 0) {
+    const itemType = bot.registry.items[itemId];
+    if (itemType) {
+      const existingItem = bot.inventory.items().find(i => i.type === itemId && i.count < itemType.stackSize);
+      if (!existingItem) {
+        return { success: false, reason: `Cannot craft intermediate item ${itemType.name}: inventory is full.` };
+      }
+    }
+  }
+
   const recipes = bot.registry.recipes[itemId];
   if (!recipes || recipes.length === 0) return { success: false, reason: `No recipes found for item ${itemId}` };
 
@@ -455,12 +517,49 @@ async function executeAction(bot, actionName, args = {}) {
 
         if (!closestMob) return { success: false, message: `No hostile mob within ${maxDist} blocks` };
 
+        // Try to equip best sword/weapon before attacking
+        await equipBestWeapon(bot);
+
         // Pathfind to within melee range, then attack
         const defaultMove = new Movements(bot);
         bot.pathfinder.setMovements(defaultMove);
         await bot.pathfinder.goto(new goals.GoalMeleeAttack(closestMob, 1));
         bot.attack(closestMob);
         return { success: true, message: `Attacking ${closestMob.name ?? 'mob'} at distance ${closestDist.toFixed(1)}` };
+      }
+
+      case 'flee': {
+        let closestMob = null;
+        let closestDist = Infinity;
+        for (const entity of Object.values(bot.entities)) {
+          if (entity === bot.entity || entity.type !== 'mob') continue;
+          const mobName = entity.name ?? entity.displayName ?? '';
+          if (!HOSTILE_MOB_NAMES.has(mobName.toLowerCase())) continue;
+          const dist = bot.entity.position.distanceTo(entity.position);
+          if (dist < closestDist) {
+            closestDist = dist;
+            closestMob = entity;
+          }
+        }
+        
+        if (!closestMob) return { success: true, message: 'No hostile mobs nearby, fleeing unnecessary.' };
+        
+        // Find a point in the opposite direction
+        const dx = bot.entity.position.x - closestMob.position.x;
+        const dz = bot.entity.position.z - closestMob.position.z;
+        const dist = Math.sqrt(dx*dx + dz*dz);
+        if (dist === 0) return { success: false, message: 'Mob is exactly on top of bot, cannot determine flee direction.' };
+        
+        const fleeDistance = 16;
+        const targetX = bot.entity.position.x + (dx / dist) * fleeDistance;
+        const targetZ = bot.entity.position.z + (dz / dist) * fleeDistance;
+        const targetY = bot.entity.position.y;
+        
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        await bot.pathfinder.goto(new goals.GoalNear(targetX, targetY, targetZ, 2));
+        
+        return { success: true, message: `Fled from ${closestMob.name ?? 'mob'}` };
       }
 
       case 'equip_item': {
@@ -503,6 +602,19 @@ async function executeAction(bot, actionName, args = {}) {
 
         if (['head', 'torso', 'legs', 'feet'].includes(dest) && !autoDest) {
            return { success: false, message: `${args.item_name} is not valid armor and cannot be equipped to the ${dest} slot.` };
+        }
+
+        const armorSlots = { head: 5, torso: 6, legs: 7, feet: 8 };
+        if (dest === 'hand') {
+          const held = bot.heldItem;
+          if (held && held.name === args.item_name) {
+             return { success: false, message: `${args.item_name} is already equipped in your hand.` };
+          }
+        } else if (armorSlots[dest]) {
+          const equipped = bot.inventory.slots[armorSlots[dest]];
+          if (equipped && equipped.name === args.item_name) {
+             return { success: false, message: `${args.item_name} is already equipped in the ${dest} slot.` };
+          }
         }
         
         try {
@@ -554,7 +666,11 @@ async function executeAction(bot, actionName, args = {}) {
           if (result.success) {
             return { success: true, message: `Successfully crafted ${count} ${args.item_name}.` };
           } else {
-            return { success: false, message: `Cannot craft ${args.item_name}. ${result.reason}` };
+            let msg = `Cannot craft ${args.item_name}. ${result.reason}`;
+            if (result.reason.includes('inventory is full')) {
+              msg += ' Free up space first using toss_item or store_in_container.';
+            }
+            return { success: false, message: msg };
           }
         } catch (err) {
           return { success: false, message: `Failed to craft ${args.item_name}: ${err.message}` };
@@ -568,6 +684,14 @@ async function executeAction(bot, actionName, args = {}) {
         if (!fuelType) return { success: false, message: `Unknown fuel item: ${args.fuel_name}` };
         
         const count = args.count || 1;
+        
+        const outItemType = bot.registry.itemsByName[args.item_name];
+        if (bot.inventory.emptySlotCount() === 0 && outItemType) {
+           const existingItem = bot.inventory.items().find(i => i.name === outItemType.name && i.count < outItemType.stackSize);
+           if (!existingItem) {
+              return { success: false, message: `Inventory full — cannot safely produce ${args.item_name}. Use store_in_container or toss_item to free space first.` };
+           }
+        }
         if (bot.inventory.count(itemType.id) < count) {
           return { success: false, message: `You do not have enough ${args.input_name} to smelt. Have: ${bot.inventory.count(itemType.id)}, need: ${count}` };
         }
@@ -659,15 +783,11 @@ async function executeAction(bot, actionName, args = {}) {
             
             log(`Furnace started. Waiting for ${count} ${args.item_name} to smelt...`, 'ACTION');
             
-            // Wait for item to finish
+            // Wait for item to finish (shortened to 2s to not block decision loop)
             let stuckTimeout = 0;
-            while (furnace.inputItem() && furnace.inputItem().count > 0 && stuckTimeout < 60) {
+            while (furnace.inputItem() && furnace.inputItem().count > 0 && stuckTimeout < 2) {
                await new Promise(r => setTimeout(r, 1000));
                stuckTimeout++;
-            }
-            
-            if (stuckTimeout >= 60) {
-               throw new Error("Smelting timed out after 60 seconds.");
             }
             
             if (furnace.outputItem() && furnace.outputItem().count > 0) {
@@ -737,6 +857,90 @@ async function executeAction(bot, actionName, args = {}) {
         }
       }
 
+      case 'store_in_container': {
+        const chestId = bot.registry.blocksByName['chest']?.id;
+        const barrelId = bot.registry.blocksByName['barrel']?.id;
+        
+        let containerBlock = null;
+        if (chestId) containerBlock = bot.findBlock({ matching: chestId, maxDistance: 16 });
+        if (!containerBlock && barrelId) containerBlock = bot.findBlock({ matching: barrelId, maxDistance: 16 });
+        
+        if (!containerBlock) return { success: false, message: `No chest or barrel found within 16 blocks.` };
+        
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        await bot.pathfinder.goto(new goals.GoalGetToBlock(containerBlock.position.x, containerBlock.position.y, containerBlock.position.z));
+        
+        let container = null;
+        try {
+          container = await bot.openContainer(containerBlock);
+          
+          let deposited = [];
+          if (args.item_name === 'overflow') {
+            const trash = ['cobblestone', 'dirt', 'sand', 'gravel', 'andesite', 'diorite', 'granite'];
+            for (const item of bot.inventory.items()) {
+              if (trash.includes(item.name)) {
+                try {
+                  await container.deposit(item.type, item.metadata, item.count);
+                  deposited.push(`${item.name} x${item.count}`);
+                } catch(e) { }
+              }
+            }
+          } else {
+            const itemType = bot.registry.itemsByName[args.item_name];
+            if (!itemType) { container.close(); return { success: false, message: `Unknown item: ${args.item_name}` }; }
+            
+            let amount = args.count;
+            if (!amount) {
+              amount = bot.inventory.items().filter(i => i.name === args.item_name).reduce((sum, i) => sum + i.count, 0);
+            }
+            if (amount > 0) {
+              await container.deposit(itemType.id, null, amount);
+              deposited.push(`${args.item_name} x${amount}`);
+            }
+          }
+          
+          container.close();
+          if (deposited.length > 0) {
+            return { success: true, message: `Deposited into container: ${deposited.join(', ')}` };
+          } else {
+            return { success: false, message: `Nothing was deposited. Container might be full or you don't have the item.` };
+          }
+        } catch (err) {
+          if (container) container.close();
+          return { success: false, message: `Failed to use container: ${err.message}` };
+        }
+      }
+
+      case 'give_item_to_player': {
+        if (!args.player_name) return { success: false, message: 'No player_name provided' };
+        if (!args.item_name) return { success: false, message: 'No item_name provided' };
+        
+        const target = bot.players[args.player_name]?.entity;
+        if (!target) return { success: false, message: `Cannot see player: ${args.player_name}` };
+        
+        const itemType = bot.registry.itemsByName[args.item_name];
+        if (!itemType) return { success: false, message: `Unknown item: ${args.item_name}` };
+        
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        await bot.pathfinder.goto(new goals.GoalNear(target.position.x, target.position.y, target.position.z, 2));
+        
+        await bot.lookAt(target.position.offset(0, target.height, 0));
+        
+        try {
+          const amount = args.count || bot.inventory.items().filter(i => i.name === args.item_name).reduce((sum, i) => sum + i.count, 0);
+          if (amount > 0) {
+            await bot.toss(itemType.id, null, amount);
+            return { success: true, message: `Gave ${amount} ${args.item_name} to ${args.player_name}` };
+          } else {
+            return { success: false, message: `You do not have any ${args.item_name} to give.` };
+          }
+        } catch (err) {
+          return { success: false, message: `Failed to give item: ${err.message}` };
+        }
+      }
+
       case 'idle': {
         return { success: true, message: 'Idling — no action taken' };
       }
@@ -749,4 +953,34 @@ async function executeAction(bot, actionName, args = {}) {
   }
 }
 
-module.exports = { TOOL_SCHEMAS, executeAction };
+/**
+ * Filters the available tools based on the current goal and nearby entities.
+ * @param {string} targetAction - The current target action from the planner.
+ * @param {Array} nearbyEntities - List of nearby entities.
+ * @returns {Array} Filtered list of tool schemas.
+ */
+function getRelevantTools(targetAction, nearbyEntities, inventoryFull = false) {
+  if (targetAction === 'none' || targetAction === 'free_explore') {
+    return TOOL_SCHEMAS;
+  }
+  
+  let hasHostile = false;
+  for (const e of nearbyEntities) {
+     if (e.type === 'mob') {
+       const mobName = e.name ?? e.displayName ?? '';
+       if (HOSTILE_MOB_NAMES.has(mobName.toLowerCase())) {
+         hasHostile = true;
+         break;
+       }
+     }
+  }
+
+  // When a target action is active, chat is not whitelisted and will be rejected.
+  // The LLM is only allowed to call targetAction or whitelisted maintenance/emergency actions.
+  const universalTools = ['idle', 'flee', 'toss_item', 'store_in_container', 'give_item_to_player', 'equip_item'];
+  if (hasHostile) universalTools.push('attack_nearest_mob');
+  
+  return TOOL_SCHEMAS.filter(t => t.name === targetAction || universalTools.includes(t.name));
+}
+
+module.exports = { TOOL_SCHEMAS, executeAction, getRelevantTools };

@@ -81,6 +81,7 @@ function setupEventHandlers() {
 
     if (bot.autoEat) {
       bot.autoEat.options = bot.autoEat.options || {}; // Provide a fallback for older versions if needed, but use bot.autoEat.options or opts.
+      bot.autoEat.opts.priority = 'saturation';
       bot.autoEat.opts.minHunger = 16;
       bot.autoEat.opts.bannedFood = ['rotten_flesh', 'spider_eye', 'poisonous_potato', 'pufferfish', 'chicken'];
       
@@ -89,6 +90,7 @@ function setupEventHandlers() {
 
       bot.autoEat.on('eatStart', (opts) => {
         log(`Eating ${opts.food.name}...`, 'SURVIVAL');
+        bot.brain_needs_food = false;
         pauseDecisionLoop();
       });
 
@@ -99,16 +101,48 @@ function setupEventHandlers() {
       
       bot.autoEat.on('eatFail', (err) => {
         log(`Failed to eat: ${err.message}`, 'SURVIVAL');
+        const hasFood = bot.inventory.items().some(item => bot.autoEat.opts.bannedFood.indexOf(item.name) === -1 && bot.registry.foodsByName[item.name]);
+        if (!hasFood) {
+          bot.brain_needs_food = true;
+          log(`Bot has no edible food in inventory! Setting brain_needs_food = true.`, 'SURVIVAL');
+        }
         resumeDecisionLoop();
       });
     }
 
-    // Auto-equip best armor
+    // Auto-equip best armor periodically
     bot.armorManager.equipAll();
+    
+    let combatWatchdog = null;
+    
+    setInterval(async () => {
+      bot.armorManager.equipAll();
+      
+      const { HOSTILE_MOB_NAMES } = require('./src/brain/constants');
+      let hostileNear = false;
+      for (const e of Object.values(bot.entities)) {
+         if (e === bot.entity || e.type !== 'mob') continue;
+         if (HOSTILE_MOB_NAMES.has(e.name?.toLowerCase() || '') && bot.entity.position.distanceTo(e.position) <= 16) {
+           hostileNear = true;
+           break;
+         }
+      }
+      
+      if (hostileNear) {
+         const shield = bot.inventory.items().find(i => i.name === 'shield');
+         if (shield && (!bot.inventory.slots[45] || bot.inventory.slots[45].name !== 'shield')) {
+           try {
+             await bot.equip(shield, 'off-hand');
+             log('Equipped shield in off-hand due to nearby hostile.', 'COMBAT');
+           } catch(e) {}
+         }
+      }
+    }, 5000);
 
     // Auto-combat finish handler
     bot.on('stoppedAttacking', () => {
       log('Combat finished! Resuming normal operations.', 'COMBAT');
+      if (combatWatchdog) { clearTimeout(combatWatchdog); combatWatchdog = null; }
       resumeDecisionLoop();
     });
   });
@@ -190,18 +224,18 @@ function setupEventHandlers() {
   });
 
   // Damaged or Attacked (mineflayer 'entityHurt' event)
-  bot.on('entityHurt', (entity) => {
+  bot.on('entityHurt', async (entity) => {
     if (entity === bot.entity) {
       log(`Bot was hurt! Current health: ${bot.health.toFixed(1)}`, 'WARNING');
       
       // Auto-defense: find the nearest hostile mob and attack it
-      const HOSTILE_TYPES = new Set(['zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'enderman', 'witch', 'blaze', 'ghast', 'zombie_piglin', 'hoglin', 'piglin_brute', 'warden', 'phantom', 'drowned', 'husk', 'stray', 'pillager', 'ravager', 'vindicator']);
+      const { HOSTILE_MOB_NAMES } = require('./src/brain/constants');
       let closestMob = null;
       let closestDist = 16; // search radius for attacker
       for (const e of Object.values(bot.entities)) {
          if (e === bot.entity || e.type !== 'mob') continue;
          const mobName = e.name ?? e.displayName ?? '';
-         if (!HOSTILE_TYPES.has(mobName.toLowerCase())) continue;
+         if (!HOSTILE_MOB_NAMES.has(mobName.toLowerCase())) continue;
          const dist = bot.entity.position.distanceTo(e.position);
          if (dist < closestDist) {
            closestDist = dist;
@@ -211,20 +245,24 @@ function setupEventHandlers() {
       
       if (closestMob && !bot.pvp.target) {
          log(`Auto-defense triggered! Engaging nearest hostile mob: ${closestMob.name}`, 'COMBAT');
+         
+         if (bot.autoEat && bot.autoEat.isEating) {
+           bot.autoEat.disableAuto();
+           bot.autoEat.enableAuto();
+           log('Cancelled eating to engage in combat!', 'COMBAT');
+         }
+
          pauseDecisionLoop();
          
-         // Try to equip best sword/weapon before attacking
-         const weapons = bot.inventory.items().filter(i => i.name.includes('sword') || i.name.includes('axe'));
-         if (weapons.length > 0) {
-            // Very simple best-weapon logic: diamond > iron > stone > wooden
-            const tierNames = ['wooden', 'stone', 'iron', 'diamond', 'netherite'];
-            weapons.sort((a, b) => {
-               const tierA = tierNames.findIndex(t => a.name.includes(t));
-               const tierB = tierNames.findIndex(t => b.name.includes(t));
-               return tierB - tierA; // higher tier first
-            });
-            bot.equip(weapons[0], 'hand').catch(() => {});
-         }
+         if (combatWatchdog) clearTimeout(combatWatchdog);
+         combatWatchdog = setTimeout(() => {
+           log('Combat watchdog timeout! Forcing decision loop resume.', 'COMBAT');
+           combatWatchdog = null;
+           resumeDecisionLoop();
+         }, 30000);
+         
+         const { equipBestWeapon } = require('./src/brain/utils');
+         await equipBestWeapon(bot);
          
          bot.pvp.attack(closestMob);
       }

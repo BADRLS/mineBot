@@ -22,6 +22,8 @@ const OLLAMA_MODEL   = process.env.OLLAMA_MODEL      || 'llama3.1';
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY    || '';
 const CLAUDE_MODEL   = 'claude-sonnet-4-6';
 
+let consecutiveFallbacks = 0;
+
 // Lazily initialise the Anthropic client only if Claude is actually used.
 let _anthropic = null;
 function getAnthropicClient() {
@@ -47,7 +49,7 @@ function getAnthropicClient() {
  * @param {Array}  tools   - TOOL_SCHEMAS from actions.js
  * @returns {Promise<{action: string, args: object}>}
  */
-async function askOllama(systemPrompt, userMessage, tools) {
+async function askOllama(systemPrompt, userMessage, tools, targetAction = 'none') {
   // Convert Claude-style schema to Ollama/OpenAI tool format
   const ollamaTools = tools.map(t => ({
     type: 'function',
@@ -101,6 +103,7 @@ async function askOllama(systemPrompt, userMessage, tools) {
 
   // If the model returned a tool call, extract it
   if (msg?.tool_calls?.length > 0) {
+    consecutiveFallbacks = 0;
     const call = msg.tool_calls[0];
     const fnName = call.function?.name;
     let fnArgs   = call.function?.arguments ?? {};
@@ -117,9 +120,25 @@ async function askOllama(systemPrompt, userMessage, tools) {
   // treat it as a chat message (graceful degradation)
   const content = msg?.content?.trim();
   if (content) {
-    return { action: 'chat', args: { message: content.slice(0, 200) } };
+    console.log(`[${new Date().toISOString()}] [WARNING] Model did not return a tool_call. Raw content: "${content.slice(0, 100)}..."`);
+    consecutiveFallbacks++;
+    if (consecutiveFallbacks >= 3) {
+      consecutiveFallbacks = 0;
+      throw new Error('Model failed to produce a valid structured tool call 3 times in a row.');
+    }
+    
+    const hasChat = tools.some(t => t.name === 'chat');
+    if (hasChat) {
+       return { action: 'chat', args: { message: content.slice(0, 200) } };
+    } else if (targetAction !== 'none' && targetAction !== 'free_explore') {
+       console.log(`[${new Date().toISOString()}] [WARNING] Chat is disabled. Falling back to target action: "${targetAction}"`);
+       return { action: targetAction, args: {} };
+    } else {
+       return { action: 'idle', args: {} };
+    }
   }
 
+  consecutiveFallbacks = 0;
   return { action: 'idle', args: {} };
 }
 
@@ -133,7 +152,7 @@ async function askOllama(systemPrompt, userMessage, tools) {
  * @param {Array}  tools   - TOOL_SCHEMAS from actions.js (Claude-native format)
  * @returns {Promise<{action: string, args: object}>}
  */
-async function askClaude(systemPrompt, userMessage, tools) {
+async function askClaude(systemPrompt, userMessage, tools, targetAction = 'none') {
   const client = getAnthropicClient();
 
   const response = await client.messages.create({
@@ -156,7 +175,12 @@ async function askClaude(systemPrompt, userMessage, tools) {
   // Fallback to text if somehow no tool was called
   const textBlock = response.content.find(b => b.type === 'text');
   if (textBlock?.text) {
-    return { action: 'chat', args: { message: textBlock.text.slice(0, 200) } };
+    const hasChat = tools.some(t => t.name === 'chat');
+    if (hasChat) {
+      return { action: 'chat', args: { message: textBlock.text.slice(0, 200) } };
+    } else if (targetAction !== 'none' && targetAction !== 'free_explore') {
+      return { action: targetAction, args: {} };
+    }
   }
 
   return { action: 'idle', args: {} };
@@ -172,11 +196,11 @@ async function askClaude(systemPrompt, userMessage, tools) {
  * @param {Array}  tools        - TOOL_SCHEMAS from actions.js
  * @returns {Promise<{action: string, args: object}>}
  */
-async function askLLM(systemPrompt, userMessage, tools) {
+async function askLLM(systemPrompt, userMessage, tools, targetAction = 'none') {
   if (PROVIDER === 'claude') {
-    return askClaude(systemPrompt, userMessage, tools);
+    return askClaude(systemPrompt, userMessage, tools, targetAction);
   }
-  return askOllama(systemPrompt, userMessage, tools);
+  return askOllama(systemPrompt, userMessage, tools, targetAction);
 }
 
 module.exports = { askLLM, PROVIDER, OLLAMA_MODEL, CLAUDE_MODEL };
