@@ -10,7 +10,7 @@ const { askLLM } = require('./llm');
 const { buildGameState } = require('./gameState');
 const { TOOL_SCHEMAS, executeAction, getRelevantTools } = require('./actions');
 const { getSystemPrompt } = require('../prompts/systemPrompt');
-const { syncGoal } = require('./advancementPlanner');
+const { syncGoal, findNearbyLogType, ALL_LOG_TYPES } = require('./advancementPlanner');
 const { SMELT_INPUTS } = require('./constants');
 
 let intervalId = null;
@@ -20,42 +20,56 @@ let recentChat = [];
 const MAX_CHAT_BUFFER = 10;
 let isDeciding = false;
 let actionHistory = []; // Tracks recent actions for loop detection
-let rejectedActionHistory = []; // Separates short-circuited actions so they don't dilute loop detection
-const MAX_ACTION_HISTORY = 5;
+const MAX_ACTION_HISTORY = 8;
 let isStuck = false;
 let stuckReason = '';
 let consecutiveLlmErrors = 0;
 
-// Goal stagnation tracking
-let lastGoalAction = '';
-let lastGoalItem = '';
-let consecutiveGoalTicks = 0;
+// Goal stagnation tracking — only counts consecutive FAILURES toward the same goal
+let lastGoalId = '';
+let consecutiveGoalFailures = 0;
+const GOAL_STAGNATION_THRESHOLD = 15;
 
 function unstick() {
   if (isStuck) {
     isStuck = false;
     stuckReason = '';
     actionHistory = [];
-    rejectedActionHistory = [];
-    consecutiveGoalTicks = 0;
-    log('Bot has been unstuck by command.', 'SYSTEM');
+    consecutiveGoalFailures = 0;
+    isDeciding = false;
+    log('Bot has been unstuck and loop rescheduled.', 'SYSTEM');
+    scheduleNextDecision();
   }
+}
+
+/**
+ * Strips the 'reasoning' field from args before comparing,
+ * since different reasoning text shouldn't count as a different action.
+ */
+function normalizeArgs(args) {
+  const copy = { ...args };
+  delete copy.reasoning;
+  return copy;
 }
 
 function detectLoop(newAction, newArgs) {
   if (newAction === 'idle' || newAction === 'chat') return 0;
   
+  const normalizedNew = normalizeArgs(newArgs);
   let identicalFailures = 0;
+  
   for (let i = actionHistory.length - 1; i >= 0; i--) {
     const hist = actionHistory[i];
     if (hist.action === newAction) {
-      if ((newAction === 'move_to' || newAction === 'place_block') && hist.args.x !== undefined && newArgs.x !== undefined) {
-        const dx = Math.abs(hist.args.x - newArgs.x);
-        const dz = Math.abs(hist.args.z - newArgs.z);
+      const normalizedHist = normalizeArgs(hist.args);
+      
+      if ((newAction === 'move_to' || newAction === 'place_block') && normalizedHist.x !== undefined && normalizedNew.x !== undefined) {
+        const dx = Math.abs(normalizedHist.x - normalizedNew.x);
+        const dz = Math.abs(normalizedHist.z - normalizedNew.z);
         if (dx <= 2 && dz <= 2) {
            if (!hist.success) identicalFailures++;
         }
-      } else if (JSON.stringify(hist.args) === JSON.stringify(newArgs)) {
+      } else if (JSON.stringify(normalizedHist) === JSON.stringify(normalizedNew)) {
         if (!hist.success) identicalFailures++;
       }
     }
@@ -168,42 +182,55 @@ async function triggerDecision(triggerReason) {
   let nextDelay = DECISION_INTERVAL_MS;
 
   // Always sync the goal from the advancement planner.
-  // This overrides any stale goal the LLM may have set itself.
   const synced = syncGoal(botInstance);
   log(`[PLANNER] Active goal: "${synced.goal}" (target: ${synced.target_item})`, 'BRAIN');
 
-  if (synced.target_action === lastGoalAction && synced.target_item === lastGoalItem && synced.target_action !== 'none' && synced.target_action !== 'free_explore') {
-    consecutiveGoalTicks++;
-  } else {
-    lastGoalAction = synced.target_action;
-    lastGoalItem = synced.target_item;
-    consecutiveGoalTicks = 1;
+  // Track stagnation by goal ID, only counting failures
+  const currentGoalId = `${synced.target_action}:${synced.target_item}`;
+  if (currentGoalId !== lastGoalId) {
+    lastGoalId = currentGoalId;
+    consecutiveGoalFailures = 0;
   }
 
-  if (consecutiveGoalTicks >= 8) {
+  if (consecutiveGoalFailures >= GOAL_STAGNATION_THRESHOLD) {
     isStuck = true;
-    stuckReason = `Goal stagnation: repeated failures trying to ${synced.target_action} ${synced.target_item}.`;
+    stuckReason = `Goal stagnation: ${consecutiveGoalFailures} consecutive failures trying to ${synced.target_action} ${synced.target_item}.`;
     botInstance.chat(`! I am stuck trying to complete my goal (${synced.target_action} ${synced.target_item}). I might need help or a !resume.`);
     log(`Goal stagnation detected! Bot is now STUCK.`, 'WARNING');
+    isDeciding = false;
     return;
   }
 
-  // Global stuck check based on position
+  // Global stuck check based on position — only trigger if many non-idle failed actions with no movement
   if (actionHistory.length >= MAX_ACTION_HISTORY) {
     let allNonIdle = true;
+    let allFailed = true;
     let posChanged = false;
     const currentPos = botInstance.entity.position;
     for (const hist of actionHistory) {
       if (hist.action === 'idle' || hist.action === 'chat') allNonIdle = false;
+      if (hist.success) allFailed = false;
       if (hist.pos && hist.pos.distanceTo(currentPos) > 1.5) {
          posChanged = true;
       }
     }
-    if (allNonIdle && !posChanged) {
+    if (allNonIdle && allFailed && !posChanged) {
+      log(`Global stuck check triggered (all ${MAX_ACTION_HISTORY} recent actions failed with no movement).`, 'WARNING');
+      botInstance.chat(`! Global stuck check triggered. Automatically resuming...`);
+      
+      try {
+        botInstance.pathfinder.setGoal(null);
+        botInstance.setControlState('jump', true);
+        setTimeout(() => {
+          botInstance.setControlState('jump', false);
+        }, 500);
+      } catch (err) {
+        log(`Failed to clear goal or jump: ${err.message}`, 'WARNING');
+      }
+
       isStuck = true;
-      stuckReason = 'Position has not changed over multiple actions. The bot may be trapped or failing to pathfind.';
-      botInstance.chat(`! I seem to be physically stuck in one place. Need help!`);
-      log(`Global stuck check triggered.`, 'WARNING');
+      isDeciding = false;
+      unstick();
       return;
     }
   }
@@ -219,24 +246,40 @@ async function triggerDecision(triggerReason) {
     console.log(userMessage);
     log('-----------------------', 'BRAIN');
 
-    log(`Sending game state to LLM (provider: ${process.env.LLM_PROVIDER || 'ollama'})...`, 'BRAIN');
-    
-    let decision;
-    try {
-      const relevantTools = getRelevantTools(stateObj.target_action, Object.values(botInstance.entities));
-      decision = await askLLM(systemPrompt, userMessage, relevantTools, stateObj.target_action);
-      consecutiveLlmErrors = 0;
-    } catch (err) {
-      consecutiveLlmErrors++;
-      if (consecutiveLlmErrors >= 3) {
-        isStuck = true;
-        stuckReason = 'LLM API appears to be down';
-        log('Circuit breaker triggered: LLM API appears to be down.', 'ERROR');
+    let decision = null;
+    let autopilotTriggered = false;
+
+    // Trigger auto-pilot if goal has had 5+ consecutive failures
+    if (stateObj.target_action !== 'none' && stateObj.target_action !== 'free_explore' && consecutiveGoalFailures >= 5) {
+      log(`[SYSTEM] Goal stagnation detected (failures: ${consecutiveGoalFailures}). Triggering auto-pilot fallback.`, 'SYSTEM');
+      decision = getAutopilotDecision(botInstance, stateObj);
+      if (decision) {
+        autopilotTriggered = true;
       }
-      throw err;
     }
-    
-    log(`LLM response received. Action: "${decision.action}", Args: ${JSON.stringify(decision.args)}`, 'BRAIN');
+
+    if (!autopilotTriggered) {
+      log(`Sending game state to LLM (provider: ${process.env.LLM_PROVIDER || 'ollama'})...`, 'BRAIN');
+      try {
+        const relevantTools = getRelevantTools(stateObj.target_action, Object.values(botInstance.entities));
+        decision = await askLLM(systemPrompt, userMessage, relevantTools, stateObj.target_action);
+        consecutiveLlmErrors = 0;
+      } catch (err) {
+        consecutiveLlmErrors++;
+        if (consecutiveLlmErrors >= 3) {
+          isStuck = true;
+          stuckReason = 'LLM API appears to be down';
+          log('Circuit breaker triggered: LLM API appears to be down.', 'ERROR');
+        }
+        throw err;
+      }
+    }
+
+    if (autopilotTriggered) {
+      log(`Auto-pilot action selected. Action: "${decision.action}", Args: ${JSON.stringify(decision.args)}`, 'BRAIN');
+    } else {
+      log(`LLM response received. Action: "${decision.action}", Args: ${JSON.stringify(decision.args)}`, 'BRAIN');
+    }
 
     // Whitelist maintenance actions and conditional emergencies
     const maintenanceActions = ['toss_item', 'store_in_container', 'give_item_to_player', 'equip_item'];
@@ -246,26 +289,22 @@ async function triggerDecision(triggerReason) {
     }
     const isWhitelisted = maintenanceActions.includes(decision.action) || emergencyActions.includes(decision.action);
 
-    // Strict target_action enforcement
-    if (!isWhitelisted && stateObj.target_action !== 'none' && stateObj.target_action !== 'free_explore' && decision.action !== stateObj.target_action) {
-      log(`Rejecting invalid action: target_action is "${stateObj.target_action}" but LLM chose "${decision.action}"`, 'WARNING');
-      const shortCircuitResult = {
-        success: false,
-        message: `Invalid action. Your target_action is "${stateObj.target_action}" — you must call that tool, not "${decision.action}". Re-read current_goal and target_item.`
-      };
-      
-      rejectedActionHistory.push({
-        action: decision.action,
-        args: decision.args,
-        success: shortCircuitResult.success,
-        message: shortCircuitResult.message,
-        pos: botInstance.entity.position.clone(),
-      });
-      if (rejectedActionHistory.length > MAX_ACTION_HISTORY) rejectedActionHistory.shift();
-      
-      consecutiveGoalTicks++; // Rejections count toward stagnation
-      nextDelay = 3000;
-      return;
+    // Also whitelist explore_randomly since it helps make progress toward any goal
+    const isExploration = decision.action === 'explore_randomly';
+
+    // Strict target_action enforcement with auto-pilot correction
+    if (!isWhitelisted && !isExploration && stateObj.target_action !== 'none' && stateObj.target_action !== 'free_explore' && decision.action !== stateObj.target_action) {
+      log(`LLM chose invalid action: "${decision.action}" when target_action is "${stateObj.target_action}". Correcting with auto-pilot.`, 'WARNING');
+      const autopilotDecision = getAutopilotDecision(botInstance, stateObj);
+      if (autopilotDecision) {
+        decision = autopilotDecision;
+      } else {
+        log(`Rejecting invalid action: target_action is "${stateObj.target_action}" but LLM chose "${decision.action}"`, 'WARNING');
+        
+        consecutiveGoalFailures++;
+        nextDelay = 3000;
+        return;
+      }
     }
 
     if (decision.action === 'craft_item' && stateObj.target_item && stateObj.target_item !== 'none') {
@@ -284,9 +323,11 @@ async function triggerDecision(triggerReason) {
           args: decision.args,
           success: shortCircuitResult.success,
           message: shortCircuitResult.message,
+          pos: botInstance.entity.position.clone(),
         });
         if (actionHistory.length > MAX_ACTION_HISTORY) actionHistory.shift();
         
+        consecutiveGoalFailures++;
         log(`Action execution failed: ${shortCircuitResult.message}`, 'WARNING');
         nextDelay = 3000;
         return;
@@ -305,7 +346,6 @@ async function triggerDecision(triggerReason) {
          log(`Auto-correcting smelt_item item_name from "${decision.args.item_name}" to "${stateObj.target_item}"`, 'BRAIN');
          decision.args.item_name = stateObj.target_item;
        }
-       // If input or fuel is missing, we can try to guess it based on target_item, but ideally the LLM gets it.
        if (!decision.args.input_name && SMELT_INPUTS[stateObj.target_item]) decision.args.input_name = SMELT_INPUTS[stateObj.target_item];
        if (!decision.args.fuel_name) {
           const fuelPrefs = ['coal', 'charcoal', 'oak_log', 'birch_log', 'spruce_log', 'oak_planks', 'birch_planks', 'jungle_log', 'dark_oak_log', 'acacia_log', 'mangrove_log', 'cherry_log', 'jungle_planks', 'dark_oak_planks', 'acacia_planks', 'mangrove_planks', 'cherry_planks'];
@@ -334,9 +374,13 @@ async function triggerDecision(triggerReason) {
     }
 
     const loopCount = detectLoop(decision.action, decision.args);
-    if (loopCount >= 3) {
+    
+    // For mine_block, allow more repeats since mining the same block type is expected gameplay
+    const loopThreshold = (decision.action === 'mine_block') ? 3 : 2;
+    
+    if (loopCount >= loopThreshold + 1) {
       isStuck = true;
-      stuckReason = `Repeated action ${decision.action} too many times with no progress.`;
+      stuckReason = `Repeated action ${decision.action} failed ${loopCount} times with no progress.`;
       botInstance.chat(`! I am stuck in a loop trying to do ${decision.action}. Please help! Use !resume to unstick me.`);
       log(`Loop detected! Bot is now STUCK.`, 'WARNING');
       nextDelay = 3000;
@@ -344,16 +388,16 @@ async function triggerDecision(triggerReason) {
     }
 
     let result;
-    if (loopCount >= 1) {
+    if (loopCount >= loopThreshold) {
       result = {
         success: false,
-        message: "You already tried this exact action and it failed. Stop trying this — it is not a valid action for your current goal. Try a completely different action."
+        message: `You already tried this exact action ${loopCount} times and it failed every time. Try a completely different approach — for mine_block, try explore_randomly first to find the block.`
       };
-      log(`Action short-circuited due to failure loop: ${decision.action}`, 'WARNING');
+      log(`Action short-circuited due to failure loop (count: ${loopCount}): ${decision.action}`, 'WARNING');
     } else {
       result = await Promise.race([
         executeAction(botInstance, decision.action, decision.args),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Action execution timed out after 20 seconds.')), 20000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Action execution timed out after 30 seconds.')), 30000))
       ]).catch(err => ({ success: false, message: err.message }));
     }
     
@@ -372,13 +416,15 @@ async function triggerDecision(triggerReason) {
 
     if (result.success) {
       log(`Action execution success: ${result.message}`, 'BRAIN');
-      consecutiveGoalTicks = 0; // Reset stagnation counter on success
+      consecutiveGoalFailures = 0; // Reset stagnation counter on any success
     } else {
       log(`Action execution failed: ${result.message}`, 'WARNING');
+      consecutiveGoalFailures++;
       nextDelay = 5000;
     }
   } catch (err) {
     log(`Error in decision loop: ${err.message}`, 'ERROR');
+    consecutiveGoalFailures++;
     nextDelay = 5000;
   } finally {
     isDeciding = false;
@@ -425,6 +471,7 @@ function startDecisionLoop(bot) {
   actionHistory = [];
   isStuck = false;
   isDeciding = false;
+  consecutiveGoalFailures = 0;
 
   // Listen for chat messages to trigger event-driven decisions
   botInstance.on('chat', handleChat);
@@ -473,6 +520,67 @@ function resumeDecisionLoop() {
     log('Decision loop resumed.', 'BRAIN');
     scheduleNextDecision();
   }
+}
+
+/**
+ * Automatically creates a correct decision object when the LLM gets stuck or makes an invalid choice.
+ * Scans for available blocks to mine instead of blindly using target_item.
+ * @param {object} bot - The Mineflayer bot instance
+ * @param {object} stateObj - Current formatted game state object
+ * @returns {object|null} A decision object or null if target_action is not handled
+ */
+function getAutopilotDecision(bot, stateObj) {
+  if (stateObj.target_action === 'mine_block') {
+    let blockToMine = stateObj.target_item;
+    
+    // For wood gathering, find whatever log type is actually nearby
+    if (ALL_LOG_TYPES.includes(stateObj.target_item)) {
+      blockToMine = findNearbyLogType(bot);
+    }
+    
+    // Check if the block actually exists nearby
+    const blockType = bot.registry.blocksByName[blockToMine];
+    if (blockType) {
+      const block = bot.findBlock({ matching: blockType.id, maxDistance: 64 });
+      if (block) {
+        return {
+          action: 'mine_block',
+          args: {
+            reasoning: `Auto-pilot: mining ${blockToMine} (found nearby).`,
+            block_type: blockToMine
+          }
+        };
+      }
+    }
+    
+    // Block not found — try exploration instead
+    return {
+      action: 'explore_randomly',
+      args: {
+        reasoning: `Auto-pilot: cannot find ${blockToMine} nearby, exploring to find it.`,
+        distance: 50
+      }
+    };
+  } else if (stateObj.target_action === 'craft_item') {
+    return {
+      action: 'craft_item',
+      args: {
+        reasoning: 'Auto-pilot fallback: crafting to achieve advancement.',
+        item_name: stateObj.target_item,
+        count: stateObj.target_count_remaining || 1
+      }
+    };
+  } else if (stateObj.target_action === 'smelt_item') {
+    return {
+      action: 'smelt_item',
+      args: {
+        reasoning: 'Auto-pilot fallback: smelting to achieve advancement.',
+        item_name: stateObj.target_item,
+        count: stateObj.target_count_remaining || 1
+      }
+    };
+  }
+  return null;
 }
 
 module.exports = {

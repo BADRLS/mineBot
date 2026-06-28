@@ -9,10 +9,10 @@
  * and more expensive LLM calls. Only include what the model genuinely needs to decide.
  */
 
-const { HOSTILE_MOB_NAMES } = require('./constants');
+const { HOSTILE_MOB_NAMES, FOOD_ANIMAL_NAMES, COOKED_FOOD_NAMES, RAW_FOOD_NAMES } = require('./constants');
 
 const MAX_NEARBY_ENTITIES  = 8;   // Show at most this many nearby entities
-const MAX_NEARBY_BLOCKS    = 10;  // Show at most this many distinct nearby block types
+const MAX_NEARBY_BLOCKS    = 12;  // Show at most this many distinct nearby block types
 const ENTITY_SCAN_RADIUS   = 24;  // Blocks radius to scan for entities
 const BLOCK_SCAN_RADIUS    = 5;   // Blocks radius to scan for distinct block types
 
@@ -25,14 +25,32 @@ function classifyEntity(entity) {
   if (entity.type === 'player') return 'player';
   const name = (entity.name ?? entity.displayName ?? '').toLowerCase();
   if (HOSTILE_MOB_NAMES.has(name)) return 'hostile';
+  if (FOOD_ANIMAL_NAMES.has(name)) return 'food_animal';
   return 'passive';
+}
+
+/**
+ * Returns a human-readable Y-level description.
+ * @param {number} y
+ * @returns {string}
+ */
+function getYLevelContext(y) {
+  if (y < 0)   return 'deep_underground (deepslate layer, diamonds possible)';
+  if (y < 16)  return 'deep_underground (diamond/redstone level)';
+  if (y < 48)  return 'underground (iron/coal/gold level)';
+  if (y < 63)  return 'near_surface';
+  if (y < 80)  return 'surface';
+  if (y < 128) return 'elevated';
+  return 'high_altitude';
 }
 
 /**
  * Builds and returns a game state snapshot object.
  * @param {object} bot - The Mineflayer bot instance
  * @param {Array}  recentChat - Rolling buffer of recent chat messages [{player, message}]
- * @param {object|null} lastActionResult - Result of the last executed action
+ * @param {Array}  actionHistory - Recent action history
+ * @param {boolean} isStuck - Whether bot is stuck
+ * @param {string}  stuckReason - Why bot is stuck
  * @returns {object} Plain JS object suitable for JSON.stringify
  */
 function buildGameState(bot, recentChat = [], actionHistory = [], isStuck = false, stuckReason = '') {
@@ -45,6 +63,18 @@ function buildGameState(bot, recentChat = [], actionHistory = [], isStuck = fals
     z: Math.round(pos.z * 10) / 10,
   };
 
+  // ── Y-Level Context ───────────────────────────────────────────────────────
+  const y_level_context = getYLevelContext(pos.y);
+
+  // ── Biome ─────────────────────────────────────────────────────────────────
+  let biome = 'unknown';
+  try {
+    const biomeData = bot.blockAt(pos)?.biome;
+    if (biomeData && biomeData.name) {
+      biome = biomeData.name;
+    }
+  } catch (e) { /* biome lookup can fail in some versions */ }
+
   // ── Vitals ────────────────────────────────────────────────────────────────
   const health = Math.round(bot.health * 10) / 10;
   const food   = bot.food;
@@ -54,8 +84,12 @@ function buildGameState(bot, recentChat = [], actionHistory = [], isStuck = fals
 
   // ── Inventory (non-empty slots, compact format) ───────────────────────────
   const invCounts = {};
+  let has_edible_food = false;
   for (const item of bot.inventory.items()) {
     invCounts[item.name] = (invCounts[item.name] || 0) + item.count;
+    if (COOKED_FOOD_NAMES.has(item.name) || RAW_FOOD_NAMES.has(item.name)) {
+      has_edible_food = true;
+    }
   }
   const inventory = Object.entries(invCounts).map(([name, count]) => `${name} x${count}`);
   const inventory_free_slots = bot.inventory.emptySlotCount();
@@ -103,6 +137,11 @@ function buildGameState(bot, recentChat = [], actionHistory = [], isStuck = fals
   else if (timeOfDayTick >= 12000 && timeOfDayTick < 13000) time_of_day = 'sunset';
   else if (timeOfDayTick >= 23000) time_of_day = 'sunrise';
 
+  // ── Weather ───────────────────────────────────────────────────────────────
+  let weather = 'clear';
+  if (bot.isRaining) weather = 'raining';
+  if (bot.thunderState) weather = 'thunderstorm';
+
   // ── Recent Chat (last 5 messages to keep context tight) ──────────────────
   const recent_chat = recentChat.slice(-5);
 
@@ -129,11 +168,12 @@ function buildGameState(bot, recentChat = [], actionHistory = [], isStuck = fals
 
   const bot_status = isStuck ? `STUCK: ${stuckReason}` : 'OK';
 
+  // Check if target block is visible nearby
   let target_block_found_at_distance = null;
   if (target_action === 'mine_block' && target_item !== 'none') {
     const blockType = bot.registry.blocksByName[target_item];
     if (blockType) {
-      const block = bot.findBlock({ matching: blockType.id, maxDistance: 32 });
+      const block = bot.findBlock({ matching: blockType.id, maxDistance: 64 });
       if (block) {
         target_block_found_at_distance = Math.round(bot.entity.position.distanceTo(block.position) * 10) / 10;
       }
@@ -148,11 +188,14 @@ function buildGameState(bot, recentChat = [], actionHistory = [], isStuck = fals
     bot_status,
     recent_actions,
     position,
+    y_level_context,
+    biome,
     health,
     health_status,
     food,
     hunger_status,
     needs_food,
+    has_edible_food,
     equipped_item,
     equipped_armor,
     inventory_free_slots,
@@ -162,6 +205,7 @@ function buildGameState(bot, recentChat = [], actionHistory = [], isStuck = fals
     nearby_blocks,
     target_block_found_at_distance,
     time_of_day,
+    weather,
     recent_chat,
   };
 }

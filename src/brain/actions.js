@@ -1,7 +1,7 @@
 /**
  * actions.js
  *
- * Defines the 6 actions the LLM can choose from, in two forms:
+ * Defines the actions the LLM can choose from, in two forms:
  *   1. TOOL_SCHEMAS  — the JSON schema sent to the LLM so it knows what's available
  *   2. executeAction — the function that actually carries out the chosen action in Mineflayer
  *
@@ -11,12 +11,18 @@
 const { Movements, goals } = require('mineflayer-pathfinder');
 const { Vec3 } = require('vec3');
 const { equipBestWeapon } = require('./utils');
-const { HOSTILE_MOB_NAMES } = require('./constants');
+const { HOSTILE_MOB_NAMES, FOOD_ANIMAL_NAMES } = require('./constants');
 
 function log(message, type = 'ACTION') {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] [${type}] ${message}`);
 }
+
+// Low-value blocks that should be capped in inventory
+const LOW_VALUE_BLOCKS = new Set([
+  'cobblestone', 'dirt', 'netherrack', 'andesite', 'diorite', 'granite',
+  'cobbled_deepslate', 'gravel', 'sand', 'tuff', 'calcite',
+]);
 
 // ─── Tool Schemas (sent to the LLM) ──────────────────────────────────────────
 
@@ -55,14 +61,14 @@ const TOOL_SCHEMAS = [
   },
   {
     name: 'mine_block',
-    description: 'Find and mine the nearest block of a given type. The bot will pathfind to it and break it.',
+    description: 'Find and mine the nearest block of a given type. The bot will pathfind to it and break it. If the block is not found nearby, consider using explore_randomly first.',
     input_schema: {
       type: 'object',
       properties: {
         reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
         block_type: {
           type: 'string',
-          description: 'The Minecraft block type to mine, e.g. "oak_log", "stone", "coal_ore", "iron_ore".',
+          description: 'The Minecraft block type to mine, e.g. "oak_log", "birch_log", "stone", "coal_ore", "iron_ore". Use the BLOCK name (what exists in the world), not the drop name.',
         },
       },
       required: ['block_type'],
@@ -108,6 +114,46 @@ const TOOL_SCHEMAS = [
     },
   },
   {
+    name: 'hunt_animal',
+    description: 'Find and attack the nearest food-providing animal (cow, pig, chicken, sheep, rabbit) to gather raw meat. The bot will automatically cook it later if needed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+      },
+    },
+  },
+  {
+    name: 'make_obsidian',
+    description: 'Uses a water bucket on a lava pool to create obsidian blocks. The bot will pathfind to a lava pool, pour water safely without burning, and pick the water back up.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+      },
+    },
+  },
+  {
+    name: 'gather_water',
+    description: 'Finds a nearby water source and fills an empty bucket. You must have an empty bucket in your inventory.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+      },
+    },
+  },
+  {
+    name: 'build_nether_portal',
+    description: 'Builds a 4x5 nether portal using 14 obsidian, lights it with flint_and_steel, and enters it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+      },
+    },
+  },
+  {
     name: 'equip_item',
     description: 'Equip an item from your inventory to your hand, head, torso, legs, or feet.',
     input_schema: {
@@ -135,7 +181,7 @@ const TOOL_SCHEMAS = [
   },
   {
     name: 'craft_item',
-    description: 'Craft an item. The bot will automatically use a nearby crafting table if required by the recipe.',
+    description: 'Craft an item. The bot will automatically use a nearby crafting table if required by the recipe, and will auto-craft intermediate items (planks, sticks, etc.).',
     input_schema: {
       type: 'object',
       properties: {
@@ -213,6 +259,17 @@ const TOOL_SCHEMAS = [
       required: ['player_name', 'item_name'],
     },
   },
+  {
+    name: 'explore_randomly',
+    description: 'Walk in a random direction to discover new terrain and resources. Use when you cannot find a needed block nearby (e.g. ore, trees). Especially useful before mining if target_block_found_at_distance is null.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reasoning: { type: 'string', description: 'Briefly explain why you chose this action (max 1 sentence).' },
+        distance: { type: 'number', description: 'How far to walk in blocks. Default is 50. Use larger values (80-100) when searching for underground ores.' },
+      },
+    },
+  },
 ];
 
 // ─── Auto-Crafting Helper ───────────────────────────────────────────────────
@@ -244,6 +301,7 @@ async function autoCraft(bot, itemId, count = 1, seen = new Set()) {
   if (!recipes || recipes.length === 0) return { success: false, reason: `No recipes found for item ${itemId}` };
 
   let lastReason = "Missing raw materials.";
+  let bestReason = null;
 
   for (const recipe of recipes) {
     let canCraftRecipe = true;
@@ -279,7 +337,9 @@ async function autoCraft(bot, itemId, count = 1, seen = new Set()) {
         const result = await autoCraft(bot, reqId, totalReq, new Set(seen));
         if (!result.success) {
           canCraftRecipe = false;
-          lastReason = `Missing raw materials (needs item ID ${reqId}).`;
+          lastReason = result.reason.includes('Recursive') || result.reason.includes('Mineflayer craft error') 
+            ? result.reason 
+            : `Missing raw materials (needs item ID ${reqId}).`;
           break;
         }
       }
@@ -335,7 +395,7 @@ async function autoCraft(bot, itemId, count = 1, seen = new Set()) {
          }
          if (!craftingTable) {
            canCraftRecipe = false;
-           lastReason = "No crafting table nearby or in inventory, and couldn't place one.";
+           bestReason = "No crafting table nearby or in inventory, and couldn't place one.";
            continue; 
          }
        }
@@ -355,12 +415,13 @@ async function autoCraft(bot, itemId, count = 1, seen = new Set()) {
            return { success: false, reason: `Mineflayer craft error: ${e.message}` };
          }
        } else {
-         lastReason = "Have items but recipesFor returned empty (Mineflayer bug or missing intermediate).";
+         const itemType = bot.registry.items[itemId];
+         bestReason = `Missing ingredients for ${itemType?.name || itemId}. If you had enough raw materials, they might have been consumed crafting a required intermediate item (like a crafting_table or sticks). Try gathering more raw materials.`;
        }
     }
   }
 
-  return { success: false, reason: lastReason };
+  return { success: false, reason: bestReason || lastReason };
 }
 
 // ─── Action Executor ──────────────────────────────────────────────────────────
@@ -409,17 +470,18 @@ async function executeAction(bot, actionName, args = {}) {
         const blockType = bot.registry.blocksByName[args.block_type];
         if (!blockType) return { success: false, message: `Unknown block type: ${args.block_type}` };
 
-        if (bot.inventory.count(blockType.id) >= 32) {
-          return { success: false, message: `You already have plenty of ${args.block_type}. You do not need to mine more for your current goal.` };
+        // Only cap low-value blocks to prevent hoarding useless materials
+        if (LOW_VALUE_BLOCKS.has(args.block_type) && bot.inventory.count(blockType.id) >= 64) {
+          return { success: false, message: `You already have plenty of ${args.block_type} (64+). You do not need to mine more.` };
         }
 
         const PICKAXE_TIERS = { wooden_pickaxe: 1, stone_pickaxe: 2, iron_pickaxe: 3, diamond_pickaxe: 4, netherite_pickaxe: 5 };
         
         let requiredTier = 0;
-        if (['stone', 'cobblestone', 'coal_ore', 'netherrack'].includes(args.block_type)) requiredTier = 1;
-        if (['iron_ore', 'lapis_ore', 'deepslate'].includes(args.block_type)) requiredTier = 2;
-        if (['gold_ore', 'diamond_ore', 'emerald_ore', 'redstone_ore'].includes(args.block_type)) requiredTier = 3;
-        if (['obsidian'].includes(args.block_type)) requiredTier = 4;
+        if (['stone', 'cobblestone', 'coal_ore', 'deepslate_coal_ore', 'netherrack'].includes(args.block_type)) requiredTier = 1;
+        if (['iron_ore', 'deepslate_iron_ore', 'lapis_ore', 'deepslate_lapis_ore', 'deepslate', 'copper_ore', 'deepslate_copper_ore'].includes(args.block_type)) requiredTier = 2;
+        if (['gold_ore', 'deepslate_gold_ore', 'diamond_ore', 'deepslate_diamond_ore', 'emerald_ore', 'deepslate_emerald_ore', 'redstone_ore', 'deepslate_redstone_ore'].includes(args.block_type)) requiredTier = 3;
+        if (['obsidian', 'crying_obsidian'].includes(args.block_type)) requiredTier = 4;
 
         if (requiredTier > 0) {
           const pickaxes = bot.inventory.items().filter(i => i.name.includes('pickaxe'));
@@ -446,12 +508,17 @@ async function executeAction(bot, actionName, args = {}) {
           }
         }
 
-        const block = bot.findBlock({
-          matching: blockType.id,
-          maxDistance: 32,
-        });
+        // Search at progressively larger distances
+        let block = null;
+        for (const searchDist of [32, 64]) {
+          block = bot.findBlock({
+            matching: blockType.id,
+            maxDistance: searchDist,
+          });
+          if (block) break;
+        }
 
-        if (!block) return { success: false, message: `No ${args.block_type} found within 32 blocks` };
+        if (!block) return { success: false, message: `No ${args.block_type} found within 64 blocks. Try using explore_randomly to move to a new area, or if looking for ores, try going underground.` };
 
         const defaultMove = new Movements(bot);
         bot.pathfinder.setMovements(defaultMove);
@@ -464,7 +531,7 @@ async function executeAction(bot, actionName, args = {}) {
 
         try {
           const expectedDigTime = bot.digTime(block);
-          const timeoutDuration = Math.max(10000, expectedDigTime + 5000); // Give 5s buffer, min 10s
+          const timeoutDuration = Math.max(10000, expectedDigTime + 5000);
           log(`Mining ${args.block_type} at ${block.position.toString()}. Expected dig time: ${expectedDigTime}ms, timeout: ${timeoutDuration}ms`, 'ACTION');
           
           await Promise.race([
@@ -608,12 +675,12 @@ async function executeAction(bot, actionName, args = {}) {
         if (dest === 'hand') {
           const held = bot.heldItem;
           if (held && held.name === args.item_name) {
-             return { success: false, message: `${args.item_name} is already equipped in your hand.` };
+             return { success: true, message: `${args.item_name} is already equipped in your hand.` };
           }
         } else if (armorSlots[dest]) {
           const equipped = bot.inventory.slots[armorSlots[dest]];
           if (equipped && equipped.name === args.item_name) {
-             return { success: false, message: `${args.item_name} is already equipped in the ${dest} slot.` };
+             return { success: true, message: `${args.item_name} is already equipped in the ${dest} slot.` };
           }
         }
         
@@ -653,11 +720,11 @@ async function executeAction(bot, actionName, args = {}) {
         
         const count = args.count || 1;
 
-        // CRITICAL: Stop the LLM from looping if it already has the item
+        // If the bot already has enough of this item, tell it to move on
         if (bot.inventory.count(itemType.id) >= count) {
           return { 
-            success: false, 
-            message: `You ALREADY HAVE ${args.item_name} in your inventory! Check your inventory. Do NOT craft it again. Move to the next step (like equipping it or crafting the final tool).`
+            success: true, 
+            message: `You already have ${bot.inventory.count(itemType.id)}x ${args.item_name} in your inventory — this goal is complete. The advancement planner will move you to the next goal automatically.`
           };
         }
 
@@ -750,8 +817,7 @@ async function executeAction(bot, actionName, args = {}) {
                await furnace.takeOutput();
             }
 
-            // Put fuel if needed. Only add if there's no fuel.
-            // We just ensure there's at least some fuel. We don't force it to match fuelType if it's already occupied.
+            // Put fuel if needed
             const currentFuel = furnace.fuelItem();
             log(`Current fuel: ${currentFuel ? currentFuel.name + 'x' + currentFuel.count : 'empty'}. Requested fuel: ${fuelType.name}`, 'ACTION');
             if (!currentFuel || currentFuel.count === 0) {
@@ -767,10 +833,8 @@ async function executeAction(bot, actionName, args = {}) {
             let neededToInsert = count;
             if (currentInput) {
                if (currentInput.type === itemType.id) {
-                 // Already has some of the right type. Insert the remainder if any.
                  neededToInsert = Math.max(0, count - currentInput.count);
                } else {
-                 // Wrong type in input slot. We can't easily extract it.
                  throw new Error("Furnace input slot is occupied by a different item.");
                }
             }
@@ -854,6 +918,177 @@ async function executeAction(bot, actionName, args = {}) {
           return { success: true, message: `Placed ${args.block_type} at roughly (${args.x}, ${args.y}, ${args.z})` };
         } catch (err) {
           return { success: false, message: `Failed to place block: ${err.message}` };
+        }
+      }
+
+      case 'hunt_animal': {
+        let closestMob = null;
+        let closestDist = Infinity;
+        for (const entity of Object.values(bot.entities)) {
+          if (entity === bot.entity || entity.type !== 'mob') continue;
+          const mobName = entity.name ?? entity.displayName ?? '';
+          if (!FOOD_ANIMAL_NAMES.has(mobName.toLowerCase())) continue;
+          const dist = bot.entity.position.distanceTo(entity.position);
+          if (dist < closestDist) {
+            closestDist = dist;
+            closestMob = entity;
+          }
+        }
+        
+        if (!closestMob) return { success: false, message: `No food animals found nearby. Try explore_randomly first.` };
+        
+        await equipBestWeapon(bot);
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        await bot.pathfinder.goto(new goals.GoalMeleeAttack(closestMob, 1));
+        bot.attack(closestMob);
+        return { success: true, message: `Attacked ${closestMob.name} for food. It may take multiple hits.` };
+      }
+
+      case 'gather_water': {
+        const bucket = bot.inventory.items().find(i => i.name === 'bucket');
+        if (!bucket) return { success: false, message: `You do not have an empty bucket.` };
+
+        const waterId = bot.registry.blocksByName['water']?.id;
+        if (!waterId) return { success: false, message: `Water not found in registry.` };
+        
+        const waterBlocks = bot.findBlocks({ matching: waterId, maxDistance: 64, count: 5 });
+        if (waterBlocks.length === 0) return { success: false, message: `No water found nearby. Explore to find a lake or river.` };
+
+        const targetWater = waterBlocks[0];
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        
+        // Go near the water
+        await bot.pathfinder.goto(new goals.GoalNear(targetWater.x, targetWater.y, targetWater.z, 2));
+        
+        await bot.equip(bucket, 'hand');
+        
+        try {
+          const waterBlock = bot.blockAt(targetWater);
+          await bot.lookAt(waterBlock.position.offset(0.5, 0.5, 0.5));
+          bot.activateItem(); // Use the bucket on the water
+          await new Promise(r => setTimeout(r, 1000));
+          
+          if (bot.inventory.items().find(i => i.name === 'water_bucket')) {
+             return { success: true, message: `Successfully filled bucket with water.` };
+          } else {
+             return { success: false, message: `Used bucket but didn't get a water_bucket. You might have missed.` };
+          }
+        } catch (e) {
+          return { success: false, message: `Failed to gather water: ${e.message}` };
+        }
+      }
+
+      case 'build_nether_portal': {
+        const obsidianCount = bot.inventory.items().filter(i => i.name === 'obsidian').reduce((acc, i) => acc + i.count, 0);
+        if (obsidianCount < 14) return { success: false, message: `Need 14 obsidian to build portal. You have ${obsidianCount}.` };
+        
+        const flintAndSteel = bot.inventory.items().find(i => i.name === 'flint_and_steel');
+        if (!flintAndSteel) return { success: false, message: `You need flint_and_steel to light the portal.` };
+
+        // For simplicity, we just look for a flat area nearby and build it.
+        // Or even simpler, just build it right in front of the bot.
+        const botPos = bot.entity.position.floored();
+        const basePos = botPos.offset(2, 0, 0);
+        
+        // This is a naive portal builder. It assumes space is clear or can be placed.
+        const portalPositions = [
+           basePos.offset(0,0,0), basePos.offset(0,0,1), basePos.offset(0,0,2), basePos.offset(0,0,3), // Bottom
+           basePos.offset(0,1,0), basePos.offset(0,2,0), basePos.offset(0,3,0), // Left side
+           basePos.offset(0,1,3), basePos.offset(0,2,3), basePos.offset(0,3,3), // Right side
+           basePos.offset(0,4,0), basePos.offset(0,4,1), basePos.offset(0,4,2), basePos.offset(0,4,3)  // Top
+        ];
+        
+        try {
+           const obsidianItem = bot.inventory.items().find(i => i.name === 'obsidian');
+           await bot.equip(obsidianItem, 'hand');
+           for (const p of portalPositions) {
+              const b = bot.blockAt(p);
+              if (b && b.name === 'air') {
+                 // Try placing against the block below
+                 const ref = bot.blockAt(p.offset(0, -1, 0));
+                 if (ref && ref.name !== 'air' && ref.boundingBox === 'block') {
+                    await bot.placeBlock(ref, new Vec3(0,1,0));
+                 }
+              }
+           }
+           
+           // Ignite
+           await bot.equip(flintAndSteel, 'hand');
+           const bottomInside = bot.blockAt(basePos.offset(0,1,1));
+           if (bottomInside) {
+             const bottomBlock = bot.blockAt(basePos.offset(0,0,1));
+             await bot.placeBlock(bottomBlock, new Vec3(0,1,0));
+           }
+
+           return { success: true, message: `Attempted to build and light portal. If it worked, walk into it by moving near it.` };
+        } catch (e) {
+           return { success: false, message: `Failed to build portal: ${e.message}` };
+        }
+      }
+
+      case 'make_obsidian': {
+        const bucket = bot.inventory.items().find(i => i.name === 'water_bucket');
+        if (!bucket) return { success: false, message: `You need a water_bucket in your inventory to make obsidian.` };
+
+        const lavaId = bot.registry.blocksByName['lava']?.id;
+        if (!lavaId) return { success: false, message: `Lava not found in registry.` };
+        
+        const lavaBlocks = bot.findBlocks({ matching: lavaId, maxDistance: 32, count: 5 });
+        if (lavaBlocks.length === 0) return { success: false, message: `No lava found nearby. Go underground or explore.` };
+
+        // Find a lava block that has a solid block next to it, so we can place water on the solid block
+        let targetLava = null;
+        let placeAgainst = null;
+        let placeFace = null;
+        for (const pos of lavaBlocks) {
+          const offsets = [new Vec3(1,0,0), new Vec3(-1,0,0), new Vec3(0,0,1), new Vec3(0,0,-1)];
+          for (const offset of offsets) {
+             const neighbor = bot.blockAt(pos.plus(offset));
+             if (neighbor && neighbor.name !== 'lava' && neighbor.name !== 'water' && neighbor.name !== 'air' && neighbor.boundingBox === 'block') {
+                targetLava = pos;
+                placeAgainst = neighbor;
+                placeFace = new Vec3(0,0,0).minus(offset); // face towards the lava
+                break;
+             }
+          }
+          if (targetLava) break;
+        }
+
+        if (!targetLava) return { success: false, message: `Found lava, but no safe adjacent block to pour water onto.` };
+
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        // Pathfind near the placeAgainst block
+        await bot.pathfinder.goto(new goals.GoalNear(placeAgainst.position.x, placeAgainst.position.y, placeAgainst.position.z, 3));
+        
+        await bot.equip(bucket, 'hand');
+        
+        try {
+          await bot.placeBlock(placeAgainst, placeFace);
+          // Wait for water to flow and turn lava to obsidian
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          
+          // Now pick the water back up (using the empty bucket)
+          const emptyBucket = bot.inventory.items().find(i => i.name === 'bucket');
+          if (emptyBucket) {
+             await bot.equip(emptyBucket, 'hand');
+             // Water should be in the same spot where we placed it (above targetLava or offset)
+             // Try to interact with the block we placed water on. In mineflayer, picking up water usually involves activating the block we just hit or activating the water block directly.
+             // Usually, right clicking with empty bucket on the water source block picks it up.
+             const waterPos = placeAgainst.position.minus(placeFace);
+             const waterBlock = bot.blockAt(waterPos);
+             if (waterBlock && (waterBlock.name === 'water' || waterBlock.name === 'flowing_water')) {
+               // A hacky way is to look at it and activateItem
+               await bot.lookAt(waterPos.offset(0.5, 0.5, 0.5));
+               bot.activateItem();
+               await new Promise(resolve => setTimeout(resolve, 500));
+             }
+          }
+          return { success: true, message: `Successfully poured water to make obsidian. Mine it with a diamond_pickaxe.` };
+        } catch (e) {
+           return { success: false, message: `Failed to pour water: ${e.message}` };
         }
       }
 
@@ -941,6 +1176,35 @@ async function executeAction(bot, actionName, args = {}) {
         }
       }
 
+      case 'explore_randomly': {
+        const distance = args.distance || 50;
+        
+        // Pick a random horizontal direction
+        const angle = Math.random() * 2 * Math.PI;
+        const targetX = bot.entity.position.x + Math.cos(angle) * distance;
+        const targetZ = bot.entity.position.z + Math.sin(angle) * distance;
+        const targetY = bot.entity.position.y;
+        
+        log(`Exploring randomly: heading ${distance} blocks in direction ${(angle * 180 / Math.PI).toFixed(0)}°`, 'ACTION');
+        
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        
+        try {
+          // Use GoalNear with a generous radius so we don't get stuck on exact coordinates
+          await Promise.race([
+            bot.pathfinder.goto(new goals.GoalNear(targetX, targetY, targetZ, 5)),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Exploration timeout')), 15000))
+          ]);
+        } catch (err) {
+          // Even if pathfinding doesn't fully complete, we've likely moved somewhere new
+          bot.pathfinder.setGoal(null);
+        }
+        
+        const newPos = bot.entity.position;
+        return { success: true, message: `Explored to (${newPos.x.toFixed(0)}, ${newPos.y.toFixed(0)}, ${newPos.z.toFixed(0)}). Look around for resources!` };
+      }
+
       case 'idle': {
         return { success: true, message: 'Idling — no action taken' };
       }
@@ -975,10 +1239,11 @@ function getRelevantTools(targetAction, nearbyEntities, inventoryFull = false) {
      }
   }
 
-  // When a target action is active, chat is not whitelisted and will be rejected.
-  // The LLM is only allowed to call targetAction or whitelisted maintenance/emergency actions.
-  const universalTools = ['idle', 'flee', 'toss_item', 'store_in_container', 'give_item_to_player', 'equip_item'];
-  if (hasHostile) universalTools.push('attack_nearest_mob');
+  // When a target action is active, only provide the target action + whitelisted tools
+  const universalTools = ['idle', 'toss_item', 'store_in_container', 'give_item_to_player', 'equip_item', 'explore_randomly', 'hunt_animal', 'build_nether_portal', 'gather_water', 'make_obsidian'];
+  if (hasHostile) {
+    universalTools.push('flee', 'attack_nearest_mob');
+  }
   
   return TOOL_SCHEMAS.filter(t => t.name === targetAction || universalTools.includes(t.name));
 }

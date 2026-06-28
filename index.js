@@ -3,6 +3,7 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 require('dotenv').config();
 
 const { startDecisionLoop, stopDecisionLoop, unstick, pauseDecisionLoop, resumeDecisionLoop } = require('./src/brain/decisionLoop');
+const { resetProgress } = require('./src/brain/advancementPlanner');
 
 const autoeat = require('mineflayer-auto-eat').loader || require('mineflayer-auto-eat').plugin || require('mineflayer-auto-eat');
 const pvp = require('mineflayer-pvp').plugin;
@@ -83,7 +84,7 @@ function setupEventHandlers() {
       bot.autoEat.options = bot.autoEat.options || {}; // Provide a fallback for older versions if needed, but use bot.autoEat.options or opts.
       bot.autoEat.opts.priority = 'saturation';
       bot.autoEat.opts.minHunger = 16;
-      bot.autoEat.opts.bannedFood = ['rotten_flesh', 'spider_eye', 'poisonous_potato', 'pufferfish', 'chicken'];
+      bot.autoEat.opts.bannedFood = ['rotten_flesh', 'spider_eye', 'poisonous_potato', 'pufferfish', 'raw_chicken'];
       
       // Enable auto-eat loop
       bot.autoEat.enableAuto();
@@ -383,6 +384,13 @@ function handleChatCommand(sender, message) {
       break;
     }
 
+    case 'reset': {
+      log('Resetting bot achievements memory...', 'SYSTEM');
+      resetProgress(bot);
+      bot.chat('Advancement memory has been wiped (including saved progress). Starting fresh!');
+      break;
+    }
+
     case 'status': {
       const pos = bot.entity.position;
       const x = pos.x.toFixed(1);
@@ -402,7 +410,7 @@ function handleChatCommand(sender, message) {
     }
 
     default:
-      bot.chat(`Unknown command: !${command}. Available commands: !come, !goto, !look, !stop, !resume, !status`);
+      bot.chat(`Unknown command: !${command}. Available commands: !come, !goto, !look, !stop, !resume, !status, !reset`);
       break;
   }
 }
